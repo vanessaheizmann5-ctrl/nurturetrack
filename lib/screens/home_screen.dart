@@ -191,30 +191,64 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   // viewport/item geometry, so it works for any built item, on- or off-screen.
   Future<void> _scrollKeyToTop(GlobalKey key) async {
     _programmaticScroll = true;
+    // 1) Wait for the entry's key to attach (post-save / day-switch can lag a
+    // frame or two before the card's RenderBox exists).
+    RenderBox? box;
     for (var attempt = 0; attempt < 12; attempt++) {
       if (!mounted) {
         _programmaticScroll = false;
         return;
       }
-      final renderObject = key.currentContext?.findRenderObject();
-      if (renderObject is RenderBox &&
-          renderObject.attached &&
-          _scroll.hasClients) {
-        final viewport = RenderAbstractViewport.of(renderObject);
-        final target = viewport
-            .getOffsetToReveal(renderObject, 0.0)
-            .offset
-            .clamp(0.0, _scroll.position.maxScrollExtent);
-        await _scroll.animateTo(
-          target,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
-        _programmaticScroll = false;
-        return;
+      final ro = key.currentContext?.findRenderObject();
+      if (ro is RenderBox && ro.attached && _scroll.hasClients) {
+        box = ro;
+        break;
       }
       await Future.delayed(const Duration(milliseconds: 80));
     }
+    if (box == null || !mounted) {
+      debugPrint('[SCROLLDBG] box never attached (key not laid out)');
+      _programmaticScroll = false;
+      return;
+    }
+    // 2) Re-assert until the layout settles. After a save the coach bubble
+    // inflates then collapses the content height (observed on-sim:
+    // maxScrollExtent swinging 784 -> 503 within ~1s), so a single
+    // getOffsetToReveal computes a STALE target and the view lands off the
+    // entry. Recompute + animate until the target stops moving between passes
+    // (mirrors the dayTop re-pin loop). _programmaticScroll stays true so the
+    // coach-follow heuristic can't fight us mid-settle.
+    double? lastTarget;
+    for (var pass = 0; pass < 8; pass++) {
+      if (!mounted) break;
+      final ro = key.currentContext?.findRenderObject();
+      if (ro is! RenderBox || !ro.attached || !_scroll.hasClients) break;
+      final viewport = RenderAbstractViewport.of(ro);
+      final target = viewport
+          .getOffsetToReveal(ro, 0.0)
+          .offset
+          .clamp(0.0, _scroll.position.maxScrollExtent);
+      debugPrint('[SCROLLDBG] pass=$pass before=${_scroll.position.pixels.toStringAsFixed(1)} '
+          'target=${target.toStringAsFixed(1)} max=${_scroll.position.maxScrollExtent.toStringAsFixed(1)}');
+      if (lastTarget != null && (target - lastTarget).abs() < 2.0) {
+        // Layout settled: make sure we are exactly on target, then stop.
+        if ((_scroll.position.pixels - target).abs() > 2.0) {
+          _scroll.jumpTo(target);
+        }
+        debugPrint('[SCROLLDBG] settled pass=$pass target=${target.toStringAsFixed(1)} '
+            'pixels=${_scroll.position.pixels.toStringAsFixed(1)} '
+            'max=${_scroll.position.maxScrollExtent.toStringAsFixed(1)}');
+        break;
+      }
+      await _scroll.animateTo(
+        target,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOut,
+      );
+      lastTarget = target;
+      await Future.delayed(const Duration(milliseconds: 90));
+    }
+    debugPrint('[SCROLLDBG] loop end pixels=${_scroll.hasClients ? _scroll.position.pixels.toStringAsFixed(1) : "n/a"}');
     _programmaticScroll = false;
   }
 
@@ -388,6 +422,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
               }
               break;
             case ScrollTarget.meal:
+              debugPrint('[SCROLLDBG] intent=meal mealId=$mealId day=${scrollIntent.day}');
               if (mealId != null) {
                 // On a same-day save the day doesn't reload, so the
                 // coordinator can fire before the new meal's card (and its
@@ -450,6 +485,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
         if (mounted && _scroll.hasClients && !_programmaticScroll) {
           final pos = _scroll.position;
           if (pos.maxScrollExtent - pos.pixels < 200) {
+            debugPrint('[SCROLLDBG] coach-follow scrollToBottom (totalItems=$totalItems '
+                'pixels=${pos.pixels.toStringAsFixed(1)} max=${pos.maxScrollExtent.toStringAsFixed(1)})');
             _scrollToBottom();
           }
         }
@@ -708,6 +745,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                     )),
                     child: ListView(
                       controller: _scroll,
+                      // Lay out the whole day, not just the viewport +/- 250px
+                      // default. Without this, a backdated entry that sorts far
+                      // off-screen (e.g. a 07:00 meal added while scrolled to the
+                      // evening) is built but NOT laid out, so its GlobalKey has
+                      // no attached RenderBox and the scroll-to-meal anchor can't
+                      // reach it (it silently no-ops). A day's thread is bounded
+                      // (~10-15 entries), so a generous cacheExtent forces every
+                      // entry to lay out and keeps getOffsetToReveal reliable.
+                      cacheExtent: 5000,
                       padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
                       children: _buildSlivers(
                       context: context,

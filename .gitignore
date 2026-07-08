@@ -52,3 +52,4 @@ api/.wrangler/
 api/node_modules/
 api/.dev.vars
 
+.obsidian/
